@@ -29,7 +29,9 @@ namespace FRCNN_API {
         }
 
         static bool prepare(const cv::Mat &input, cv::Mat &img);
-        static bool preprocess(const cv::Mat &img_in, vector<boost::shared_ptr<Blob<float> > >& input);
+        static bool preprocess(const cv::Mat &img, vector<boost::shared_ptr<Blob<float> > >& input);
+        static bool copySingleBlob(vector<boost::shared_ptr<Blob<float> > >& input, int i, vector<boost::shared_ptr<Blob<float> > >& output);
+        static bool batch_preprocess(const vector < cv::Mat > &imgs, vector<boost::shared_ptr<Blob<float> > >& input);
         static bool postprocess(const cv::Mat &img, vector<boost::shared_ptr<Blob<float> > >& input, std::vector<caffe::Frcnn::BBox<float> > &output);
         bool predict(vector<boost::shared_ptr<Blob<float> > >& input, vector<boost::shared_ptr<Blob<float> > >& output);
 

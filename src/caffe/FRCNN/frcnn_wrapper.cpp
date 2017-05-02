@@ -11,7 +11,7 @@ void Frcnn_wrapper::Set_Model(std::string &proto_file, std::string &model_file, 
 }
 
 bool Frcnn_wrapper::prepare(const cv::Mat &input, cv::Mat &img) {
-  CHECK(FrcnnParam::test_scales.size() == 1) << "Only single-image batch implemented";
+  //CHECK(FrcnnParam::test_scales.size() == 1) << "Only single-image batch implemented";
 
   float scale_factor = caffe::Frcnn::get_scale_factor(input.cols, input.rows, FrcnnParam::test_scales[0], FrcnnParam::test_max_size);
 
@@ -19,17 +19,71 @@ bool Frcnn_wrapper::prepare(const cv::Mat &input, cv::Mat &img) {
   const int width = input.cols;
   DLOG(INFO) << "height: " << height << " width: " << width;
   input.convertTo(img, CV_32FC3);
-  //for (int r = 0; r < img.rows; r++) {
-  //  for (int c = 0; c < img.cols; c++) {
-  //    int offset = (r * img.cols + c) * 3;
-  //    reinterpret_cast<float *>(img.data)[offset + 0] -= FrcnnParam::pixel_means[0]; // B
-  //    reinterpret_cast<float *>(img.data)[offset + 1] -= FrcnnParam::pixel_means[1]; // G
-  //    reinterpret_cast<float *>(img.data)[offset + 2] -= FrcnnParam::pixel_means[2]; // R
-  //  }
-  //}
+  for (int r = 0; r < img.rows; r++) {
+    for (int c = 0; c < img.cols; c++) {
+      int offset = (r * img.cols + c) * 3;
+      reinterpret_cast<float *>(img.data)[offset + 0] -= FrcnnParam::pixel_means[0]; // B
+      reinterpret_cast<float *>(img.data)[offset + 1] -= FrcnnParam::pixel_means[1]; // G
+      reinterpret_cast<float *>(img.data)[offset + 2] -= FrcnnParam::pixel_means[2]; // R
+    }
+  }
   cv::resize(img, img, cv::Size(), scale_factor, scale_factor);
-  
+
   return true;
+}
+
+bool Frcnn_wrapper::batch_preprocess(const vector < cv::Mat > &img_in, vector<boost::shared_ptr<Blob<float> > >& input) {
+    int nmat = img_in.size();
+    boost::shared_ptr<Blob<float> > blob_pointer(new Blob<float>());
+    blob_pointer->Reshape(nmat, img_in.at(0).channels(), img_in.at(0).rows, img_in.at(0).cols);
+
+    float *blob_data = blob_pointer->mutable_cpu_data();
+    const int cols = img_in.at(0).cols;
+    const int rows = img_in.at(0).rows;
+    int offset = img_in.at(0).channels() * img_in.at(0).rows * img_in.at(0).cols;
+    for (int i = 0; i < nmat; i++) {
+        cv::Mat img = img_in.at(i);
+        if (i > 0) {
+            CHECK_EQ(img.channels(), img_in.at(0).channels()) << "all image need same channel";
+            CHECK_EQ(img.rows, img_in.at(0).rows) << "all image need same height!";
+            CHECK_EQ(img.cols, img_in.at(0).cols) << "all image need same width!";
+        }
+        float* ptr = blob_data + i * offset;
+        CHECK(img.isContinuous()) << "Warning : cv::Mat img_out is not Continuous !";
+        DLOG(ERROR) << "img (CHW) : " << img.channels() << ", " << img.rows << ", " << img.cols;
+        for (int j = 0; j < cols * rows; j++) {
+            ptr[cols * rows * 0 + j] =
+                reinterpret_cast<float*>(img.data)[j * 3 + 0];// mean_[0];
+            ptr[cols * rows * 1 + j] =
+                reinterpret_cast<float*>(img.data)[j * 3 + 1];// mean_[1];
+            ptr[cols * rows * 2 + j] =
+                reinterpret_cast<float*>(img.data)[j * 3 + 2];// mean_[2];
+        }
+    }
+    input.push_back(blob_pointer);
+    
+    return true;
+}
+
+bool Frcnn_wrapper::copySingleBlob(vector<boost::shared_ptr<Blob<float> > >& input, int i, vector<boost::shared_ptr<Blob<float> > >& output) {
+    for (vector<boost::shared_ptr<Blob<float> > >::iterator iter = input.begin(); iter != input.end(); ++iter) {
+        boost::shared_ptr<Blob<float> > cb = *iter;
+        if (i >= cb->num()) {
+            return false;
+        }
+        boost::shared_ptr<Blob<float> > blob_pointer(new Blob<float>());
+        blob_pointer->Reshape(1, cb->channels(), cb->height(), cb->width());
+
+        float *cb_data = cb->mutable_cpu_data();
+        float *blob_data = blob_pointer->mutable_cpu_data();
+
+        std::memcpy(blob_data, (char*)cb_data + sizeof(float) * i * cb->channels() * cb->height() * cb->width(), 
+            sizeof(float) * cb->channels() * cb->height() * cb->width());
+
+        output.push_back(blob_pointer);
+    }
+
+    return true;
 }
 
 bool Frcnn_wrapper::preprocess(const cv::Mat &img, vector<boost::shared_ptr<Blob<float> > >& input) {

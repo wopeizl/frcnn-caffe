@@ -15,174 +15,380 @@ namespace caffe {
 namespace Frcnn {
 
 using std::vector;
+using namespace std;
 
 template <typename Dtype>
 void FrcnnProposalLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype> *> &bottom,
   const vector<Blob<Dtype> *> &top) {
 
-#ifndef CPU_ONLY
-  CUDA_CHECK(cudaMalloc(&anchors_, sizeof(float) * FrcnnParam::anchors.size()));
-  CUDA_CHECK(cudaMemcpy(anchors_, &(FrcnnParam::anchors[0]),
-                        sizeof(float) * FrcnnParam::anchors.size(), cudaMemcpyHostToDevice));
+    feat_stride_ = FrcnnParam::feat_stride;
+    CHECK_GT(feat_stride_, 0);
+    LOG(INFO) << "Feature stride: " << feat_stride_;
+    // default values to compute anchors
+    int base_size = 16;
+    float arr0[] = { 0.5, 1, 2 };
+    vector<float> ratios(arr0, arr0 + sizeof(arr0) / sizeof(arr0[0]));
+    int arr1[] = { 8, 16, 32 };
+    vector<int> scales(arr1, arr1 + sizeof(arr1) / sizeof(arr1[0]));
 
-  const int rpn_pre_nms_top_n = 
-    this->phase_ == TRAIN ? FrcnnParam::rpn_pre_nms_top_n : FrcnnParam::test_rpn_pre_nms_top_n;
-  CUDA_CHECK(cudaMalloc(&transform_bbox_, sizeof(float) * rpn_pre_nms_top_n * 4));
-  CUDA_CHECK(cudaMalloc(&selected_flags_, sizeof(int) * rpn_pre_nms_top_n));
+    vector<vector<float> > anchors = generate_anchors(base_size, ratios, scales);
+    LOG(INFO) << "Anchors: ";
+    for (int i = 0; i < anchors.size(); ++i) {
+        LOG(INFO) << anchors[i][0] << " " << anchors[i][1]
+            << " " << anchors[i][2] << " " << anchors[i][3];
+    }
+    num_anchors_ = anchors.size();
+    anchors_.Reshape(1, 1, 1, 4 * num_anchors_);
+    float* anchors_data = anchors_.mutable_cpu_data();
+    for (int i = 0; i < num_anchors_; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            anchors_data[i * 4 + j] = anchors[i][j];
+        }
+    }
+}
 
-  const int rpn_post_nms_top_n = 
-    this->phase_ == TRAIN ? FrcnnParam::rpn_post_nms_top_n : FrcnnParam::test_rpn_post_nms_top_n;
-  CUDA_CHECK(cudaMalloc(&gpu_keep_indices_, sizeof(int) * rpn_post_nms_top_n));
+template <typename Dtype>
+void FrcnnProposalLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
 
-#endif
-  top[0]->Reshape(1, 5, 1, 1);
-  if (top.size() > 1) {
-    top[1]->Reshape(1, 1, 1, 1);
-  }
+    int post_nms_topN = 0;
+    if (this->phase_ == TRAIN) {
+        post_nms_topN = FrcnnParam::rpn_post_nms_top_n;
+    }
+    else {
+        post_nms_topN = FrcnnParam::test_rpn_post_nms_top_n;
+    }
+
+    vector<int> roi_shape;
+    roi_shape.push_back(post_nms_topN);
+    roi_shape.push_back(5);
+    top[0]->Reshape(roi_shape);
 }
 
 template <typename Dtype>
 void FrcnnProposalLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype> *> &bottom,
                                             const vector<Blob<Dtype> *> &top) {
-  DLOG(ERROR) << "========== enter proposal layer";
-  const Dtype *bottom_rpn_score = bottom[0]->cpu_data();  // rpn_cls_prob_reshape
-  const Dtype *bottom_rpn_bbox = bottom[1]->cpu_data();   // rpn_bbox_pred
-  const Dtype *bottom_im_info = bottom[2]->cpu_data();    // im_info
+    int pre_nms_topN;
+    int post_nms_topN;
+    float min_size;
+    float nms_thresh;
 
-  const int num = bottom[1]->num();
-  const int channes = bottom[1]->channels();
-  const int height = bottom[1]->height();
-  const int width = bottom[1]->width();
-  CHECK(num == 1) << "only single item batches are supported";
-  CHECK(channes % 4 == 0) << "rpn bbox pred channels should be divided by 4";
+    if (this->phase_ == TRAIN) {
+        pre_nms_topN = FrcnnParam::rpn_pre_nms_top_n;
+        post_nms_topN = FrcnnParam::rpn_post_nms_top_n;
+        nms_thresh = FrcnnParam::rpn_nms_thresh;
+        min_size = FrcnnParam::rpn_min_size;
+    }
+    else {
+        pre_nms_topN = FrcnnParam::test_rpn_pre_nms_top_n;
+        post_nms_topN = FrcnnParam::test_rpn_post_nms_top_n;
+        nms_thresh = FrcnnParam::test_rpn_nms_thresh;
+        min_size = FrcnnParam::test_rpn_min_size;
+    }
 
-  const float im_height = bottom_im_info[0];
-  const float im_width = bottom_im_info[1];
+    const Dtype* bottom_scores = bottom[0]->cpu_data();
+    const Dtype* bottom_bbox_deltas = bottom[1]->cpu_data();
+    const Dtype* bottom_im_info = bottom[2]->cpu_data();
 
-  int rpn_pre_nms_top_n;
-  int rpn_post_nms_top_n;
-  float rpn_nms_thresh;
-  int rpn_min_size;
-  if (this->phase_ == TRAIN) {
-    rpn_pre_nms_top_n = FrcnnParam::rpn_pre_nms_top_n;
-    rpn_post_nms_top_n = FrcnnParam::rpn_post_nms_top_n;
-    rpn_nms_thresh = FrcnnParam::rpn_nms_thresh;
-    rpn_min_size = FrcnnParam::rpn_min_size;
-  } else {
-    rpn_pre_nms_top_n = FrcnnParam::test_rpn_pre_nms_top_n;
-    rpn_post_nms_top_n = FrcnnParam::test_rpn_post_nms_top_n;
-    rpn_nms_thresh = FrcnnParam::test_rpn_nms_thresh;
-    rpn_min_size = FrcnnParam::test_rpn_min_size;
-  }
-  const int config_n_anchors = FrcnnParam::anchors.size() / 4;
-  LOG_IF(ERROR, rpn_pre_nms_top_n <= 0 ) << "rpn_pre_nms_top_n : " << rpn_pre_nms_top_n;
-  LOG_IF(ERROR, rpn_post_nms_top_n <= 0 ) << "rpn_post_nms_top_n : " << rpn_post_nms_top_n;
-  if (rpn_pre_nms_top_n <= 0 || rpn_post_nms_top_n <= 0 ) return;
+    Dtype* top_rois = top[0]->mutable_cpu_data();
+    caffe_set(top[0]->count(), Dtype(0), top_rois);
 
-  std::vector<Point4f<Dtype> > anchors;
-  typedef pair<Dtype, int> sort_pair;
-  std::vector<sort_pair> sort_vector;
+    // 1. Generate proposals from bbox deltas and shifted anchors
+    int height = bottom[0]->height();
+    int width = bottom[0]->width();
 
-  const Dtype bounds[4] = { im_width - 1, im_height - 1, im_width - 1, im_height -1 };
-  const Dtype min_size = bottom_im_info[2] * rpn_min_size;
+    LOG(INFO) << "score map size: " << height << "x" << width;
+    //CPUTimer timer;
+    //timer.Start();
+    //double part_time = 0;
 
-  DLOG(ERROR) << "========== generate anchors";
-  
-  for (int j = 0; j < height; j++) {
-    for (int i = 0; i < width; i++) {
-      for (int k = 0; k < config_n_anchors; k++) {
-        Dtype score = bottom_rpn_score[config_n_anchors * height * width +
-                                       k * height * width + j * width + i];
-        //const int index = i * height * config_n_anchors + j * config_n_anchors + k;
+    // enumerate all shifts 
+    vector<int> shift_x, shift_y;
+    for (int i = 0; i < height; ++i) {
+        for (int j = 0; j < width; ++j) {
+            shift_x.push_back(j * feat_stride_);
+            shift_y.push_back(i * feat_stride_);
+        }
+    }
 
-        Point4f<Dtype> anchor(
-            FrcnnParam::anchors[k * 4 + 0] + i * FrcnnParam::feat_stride,  // shift_x[i][j];
-            FrcnnParam::anchors[k * 4 + 1] + j * FrcnnParam::feat_stride,  // shift_y[i][j];
-            FrcnnParam::anchors[k * 4 + 2] + i * FrcnnParam::feat_stride,  // shift_x[i][j];
-            FrcnnParam::anchors[k * 4 + 3] + j * FrcnnParam::feat_stride); // shift_y[i][j];
+    vector<vector<int> > shifts;
+    vector<int> single_shift;
+    int K = shift_x.size();
 
-        Point4f<Dtype> box_delta(
-            bottom_rpn_bbox[(k * 4 + 0) * height * width + j * width + i],
-            bottom_rpn_bbox[(k * 4 + 1) * height * width + j * width + i],
-            bottom_rpn_bbox[(k * 4 + 2) * height * width + j * width + i],
-            bottom_rpn_bbox[(k * 4 + 3) * height * width + j * width + i]);
+    for (int i = 0; i < K; ++i)
+    {
+        single_shift.clear();
+        single_shift.push_back(shift_x[i]);
+        single_shift.push_back(shift_y[i]);
+        single_shift.push_back(shift_x[i]);
+        single_shift.push_back(shift_y[i]);
+        shifts.push_back(single_shift);
+    }
+    int A = num_anchors_;
+    vector<vector<int> > shifted_anchors; // sas
+    const float* anchors_data = anchors_.cpu_data();
+    for (int i = 0; i < K; ++i) {
+        for (int j = 0; j < A; ++j) {
+            vector<int> single_sa;
+            for (int k = 0; k < 4; ++k) {
+                single_sa.push_back(anchors_data[j * 4 + k] + shifts[i][k]);
+            }
+            shifted_anchors.push_back(single_sa);
+            // LOG(INFO) << single_sa[0] << "," << single_sa[1] << "," << single_sa[2] << "," << single_sa[3];
+        }
+    }
 
-        Point4f<Dtype> cbox = bbox_transform_inv(anchor, box_delta);
-        
+    vector<vector<Dtype> > deltas;
+    for (int h = 0; h < height; ++h) {
+        for (int w = 0; w < width; ++w) {
+            for (int a = 0; a < num_anchors_; ++a) {
+                vector<Dtype> single_ds;
+                for (int k = 0; k < 4; ++k) {
+                    // const int index = a*4 + w * num_anchors_*4 + h*width*num_anchors_*4;
+                    const int index = w + h*width + (a * 4 + k)*(height*width);
+                    single_ds.push_back(bottom_bbox_deltas[index]);
+                }
+                deltas.push_back(single_ds);
+            }
+        }
+    }
+
+    vector<Dtype> scores, scores_kept;
+    for (int h = 0; h < height; ++h) {
+        for (int w = 0; w < width; ++w) {
+            for (int a = 0; a < num_anchors_; ++a) {
+                const int index = w + h*width + (num_anchors_ + a)*(height*width);
+                scores.push_back(bottom_scores[index]);
+            }
+        }
+    }
+    //std::cout << std::endl;
+
+    //part_time += timer.MicroSeconds();
+    //std::cout << "P1: elapsed time: " << part_time << std::endl;
+    //part_time = 0; timer.Start();
+
+    int im_height, im_width;
+    im_height = bottom_im_info[0];
+    im_width = bottom_im_info[1];
+    // LOG(INFO) << "im height: " << im_height << " im width: " << im_width;
+    LOG(INFO) << "im_size: (" << im_height << ", " << im_width << ")";
+    LOG(INFO) << "scale: " << bottom_im_info[2];
+    float im_min_size = min_size * bottom_im_info[2];
+
+    CHECK_EQ(shifted_anchors.size(), deltas.size());
+    vector<vector<float> > proposals;
+    for (int i = 0; i < shifted_anchors.size(); ++i) {
+        float ctr_x, ctr_y, w, h;
+        float pred_ctr_x, pred_ctr_y, pred_w, pred_h;
+        vector<float> box;
+        w = shifted_anchors[i][2] - shifted_anchors[i][0] + 1.0;
+        h = shifted_anchors[i][3] - shifted_anchors[i][1] + 1.0;
+        ctr_x = shifted_anchors[i][0] + 0.5*w;
+        ctr_y = shifted_anchors[i][1] + 0.5*h;
+
+        pred_ctr_x = deltas[i][0] * w + ctr_x;
+        pred_ctr_y = deltas[i][1] * h + ctr_y;
+        pred_w = exp(deltas[i][2]) * w;
+        pred_h = exp(deltas[i][3]) * h;
+
         // 2. clip predicted boxes to image
-        for (int q = 0; q < 4; q++) {
-          cbox.Point[q] = std::max(Dtype(0), std::min(cbox[q], bounds[q]));
-        }
+        float x1, y1, x2, y2;
+        x1 = max(min(pred_ctr_x - 0.5 * pred_w, im_width - 1.0), 0.0);
+        y1 = max(min(pred_ctr_y - 0.5 * pred_h, im_height - 1.0), 0.0);
+        x2 = max(min(pred_ctr_x + 0.5 * pred_w, im_width - 1.0), 0.0);
+        y2 = max(min(pred_ctr_y + 0.5 * pred_h, im_height - 1.0), 0.0);
+
         // 3. remove predicted boxes with either height or width < threshold
-        if((cbox[2] - cbox[0] + 1) >= min_size && (cbox[3] - cbox[1] + 1) >= min_size) {
-          const int now_index = sort_vector.size();
-          sort_vector.push_back(sort_pair(score, now_index)); 
-          anchors.push_back(cbox);
+        if ((x2 - x1 + 1 >= im_min_size) && (y2 - y1 + 1 >= im_min_size))
+        {
+            box.clear();
+            box.push_back(x1);
+            box.push_back(y1);
+            box.push_back(x2);
+            box.push_back(y2);
+            proposals.push_back(box);
+            scores_kept.push_back(scores[i]);
+            // LOG(INFO) << box[0] << "," << box[1] << "," << box[2] << "," << box[3];
         }
-      }
     }
-  }
 
-  DLOG(ERROR) << "========== after clip and remove size < threshold box " << (int)sort_vector.size();
+    // 4. sort all: take the pre_nms_topN
+    vector<data> proposal_pairs(proposals.size());
+    for (int i = 0; i < proposals.size(); ++i) {
+        proposal_pairs[i].bbox = proposals[i];
+        proposal_pairs[i].score = (float)scores_kept[i];
+        proposal_pairs[i].index = i;
+    }
 
-  std::sort(sort_vector.begin(), sort_vector.end(), std::greater<sort_pair>());
-  const int n_anchors = std::min((int)sort_vector.size(), rpn_pre_nms_top_n);
-  //sort_vector.erase(sort_vector.begin() + n_anchors, sort_vector.end());
-  //anchors.erase(anchors.begin() + n_anchors, anchors.end());
-  std::vector<bool> select(n_anchors, true);
+    std::sort(proposal_pairs.begin(), proposal_pairs.end(), by_score());
 
-  // apply nms
-  DLOG(ERROR) << "========== apply nms, pre nms number is : " << n_anchors;
-  std::vector<Point4f<Dtype> > box_final;
-  std::vector<Dtype> scores_;
-  for (int i = 0; i < n_anchors && box_final.size() < rpn_post_nms_top_n; i++) {
-    if (select[i]) {
-      const int cur_i = sort_vector[i].second;
-      for (int j = i + 1; j < n_anchors; j++)
-        if (select[j]) {
-          const int cur_j = sort_vector[j].second;
-          if (get_iou(anchors[cur_i], anchors[cur_j]) > rpn_nms_thresh) {
-            select[j] = false;
-          }
+    // 5. take top pre_nms_topN (e.g. 6000)
+    if (pre_nms_topN > 0) {
+        // proposal_pairs.erase(proposal_pairs.begin() + pre_nms_topN, proposal_pairs.end());
+        proposal_pairs.resize(pre_nms_topN);
+    }
+
+    //part_time += timer.MicroSeconds();
+    //std::cout << "P2: elapsed time: " << part_time << std::endl;
+    //part_time = 0; timer.Start();
+
+    // 6. apply nms (e.g. threshold = 0.7)
+    //nms_thresh
+    vector<int> keep = nms_cpu(proposal_pairs, nms_thresh);
+
+    //part_time += timer.MicroSeconds();
+    //std::cout << "P3: elapsed time: " << part_time << std::endl;
+    //part_time = 0; timer.Start();
+
+    // 7. take post_nms_topN (e.g. 300)
+    // 8. return the top proposals (-> RoIs top)
+    if (post_nms_topN > 0 && keep.size() > post_nms_topN) {
+        keep.resize(post_nms_topN);
+    }
+
+    for (int i = 0; i < keep.size(); ++i) {
+        top_rois[5 * i] = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            top_rois[5 * i + 1 + k] = proposal_pairs[keep[i]].bbox[k];
         }
-      box_final.push_back(anchors[cur_i]);
-      scores_.push_back(sort_vector[i].first);
+        // LOG(INFO) << top_rois[5*i + 1] << " " << top_rois[5*i + 2] << " " << top_rois[5*i + 3] << " " << top_rois[5*i + 4];
     }
-  }
 
-  DLOG(ERROR) << "rpn number after nms: " <<  box_final.size();
+    // if (top.size() >= 2) {
+    // 	Dtype* top_scores = top[1]->mutable_cpu_data();
+    // 	caffe_set(top[1]->count(), Dtype(0), top_scores);
 
-  DLOG(ERROR) << "========== copy to top";
-  top[0]->Reshape(box_final.size(), 5, 1, 1);
-  Dtype *top_data = top[0]->mutable_cpu_data();
-  CHECK_EQ(box_final.size(), scores_.size());
-  for (size_t i = 0; i < box_final.size(); i++) {
-    Point4f<Dtype> &box = box_final[i];
-    top_data[i * 5] = 0;
-    for (int j = 1; j < 5; j++) {
-      top_data[i * 5 + j] = box[j - 1];
+    // 	for (int i = 0; i < keep.size(); ++i) {
+    // 		top_scores[i] = proposal_pairs[keep[i]].score;
+    // 	}
+    // 	top[1]->Reshape(1, A, height, width);
+    // }
     }
-  }
-
-  if (top.size() > 1) {
-    top[1]->Reshape(box_final.size(), 1, 1, 1);
-    for (size_t i = 0; i < box_final.size(); i++) {
-      top[1]->mutable_cpu_data()[i] = scores_[i];
-    }
-  }
-
-  DLOG(ERROR) << "========== exit proposal layer";
-}
 
 template <typename Dtype>
 void FrcnnProposalLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype> *> &top,
     const vector<bool> &propagate_down, const vector<Blob<Dtype> *> &bottom) {
-  for (int i = 0; i < propagate_down.size(); ++i) {
-    if (propagate_down[i]) {
       NOT_IMPLEMENTED;
-    }
-  }
 }
+
+template <typename Dtype>
+vector<int> FrcnnProposalLayer<Dtype>::nms_cpu(vector<data> dets, float thresh)
+{
+    int ndets = dets.size();
+    vector<int> suppressed(ndets);
+    for (int i = 0; i < ndets; ++i) {
+        dets[i].index = i;
+        suppressed[i] = 0;
+    }
+    // sort(dets.begin(), dets.end(), by_score());
+    vector<int> order(ndets);
+    for (int i = 0; i < ndets; ++i) {
+        order[i] = dets[i].index;
+    }
+    vector<int> keep;
+    int i, j;
+    float ix1, iy1, ix2, iy2, iarea;
+    float jx1, jy1, jx2, jy2, jarea;
+    float xx1, yy1, xx2, yy2, w, h, inter, ovr;
+    for (int _i = 0; _i < ndets; ++_i) {
+        i = order[_i];
+        if (suppressed[i] == 1) continue;
+        keep.push_back(i);
+        ix1 = dets[i].bbox[0];
+        iy1 = dets[i].bbox[1];
+        ix2 = dets[i].bbox[2];
+        iy2 = dets[i].bbox[3];
+        iarea = (ix2 - ix1 + 1) * (iy2 - iy1 + 1);
+        for (int _j = _i + 1; _j < ndets; ++_j) {
+            j = order[_j];
+            if (suppressed[j] == 1) continue;
+            jx1 = dets[j].bbox[0];
+            jy1 = dets[j].bbox[1];
+            jx2 = dets[j].bbox[2];
+            jy2 = dets[j].bbox[3];
+            xx1 = max(ix1, jx1);
+            yy1 = max(iy1, jy1);
+            xx2 = min(ix2, jx2);
+            yy2 = min(iy2, jy2);
+            w = max(float(0.), xx2 - xx1 + 1);
+            h = max(float(0.), yy2 - yy1 + 1);
+            jarea = (jx2 - jx1 + 1) * (jy2 - jy1 + 1);
+            inter = w * h;
+            ovr = inter / (iarea + jarea - inter);
+            if (ovr >= thresh) suppressed[j] = 1;
+        }
+    }
+    return keep;
+}
+
+template <typename Dtype>
+vector<vector<float> > FrcnnProposalLayer<Dtype>::_ratio_enum(vector<int> base_anchor, vector<float> ratios)
+{
+    int w = base_anchor[2] - base_anchor[0] + 1;
+    int h = base_anchor[3] - base_anchor[1] + 1;
+    float x_ctr = base_anchor[0] + 0.5*(w - 1);
+    float y_ctr = base_anchor[1] + 0.5*(h - 1);
+    int size = w * h;
+    float wi, hi;
+    vector<vector<float> > ratio_anchors(ratios.size());
+    for (int i = 0; i < ratios.size(); ++i)
+    {
+        wi = round(sqrt(1.0*size / ratios[i]));
+        hi = round(wi*ratios[i]);
+        ratio_anchors[i].push_back(x_ctr - 0.5*(wi - 1));
+        ratio_anchors[i].push_back(y_ctr - 0.5*(hi - 1));
+        ratio_anchors[i].push_back(x_ctr + 0.5*(wi - 1));
+        ratio_anchors[i].push_back(y_ctr + 0.5*(hi - 1));
+    }
+    // LOG(INFO) << "ratio size: " << ratios.size();
+    return ratio_anchors;
+}
+
+template <typename Dtype>
+vector<vector<float> > FrcnnProposalLayer<Dtype>::_scale_enum(vector<float> base_anchor, vector<int> scales)
+{
+    CHECK_EQ(base_anchor.size(), 4);
+    float w = base_anchor[2] - base_anchor[0] + 1;
+    float h = base_anchor[3] - base_anchor[1] + 1;
+    float x_ctr = base_anchor[0] + 0.5*(w - 1);
+    float y_ctr = base_anchor[1] + 0.5*(h - 1);
+    float wi, hi;
+    vector<vector<float> > scale_anchors(scales.size());
+    for (int i = 0; i < scales.size(); ++i)
+    {
+        wi = w * scales[i];
+        hi = h * scales[i];
+        scale_anchors[i].push_back(x_ctr - 0.5*(wi - 1));
+        scale_anchors[i].push_back(y_ctr - 0.5*(hi - 1));
+        scale_anchors[i].push_back(x_ctr + 0.5*(wi - 1));
+        scale_anchors[i].push_back(y_ctr + 0.5*(hi - 1));
+    }
+    // LOG(INFO) << "scale size: " << scales.size();
+    return scale_anchors;
+}
+
+template <typename Dtype>
+vector<vector<float> > FrcnnProposalLayer<Dtype>::generate_anchors(int base_size, vector<float> ratios, vector<int> scales)
+{
+    vector<int> base_anchor;
+    vector<vector<float> > anchors;
+    base_anchor.push_back(0);
+    base_anchor.push_back(0);
+    base_anchor.push_back(base_size - 1);
+    base_anchor.push_back(base_size - 1);
+    vector<vector<float> >  ratio_anchors = _ratio_enum(base_anchor, ratios);
+    anchors.reserve(ratios.size() * scales.size());
+    for (int i = 0; i < ratio_anchors.size(); ++i)
+    {
+        vector<vector<float> > scale_anchors = _scale_enum(ratio_anchors[i], scales);
+        anchors.insert(anchors.end(), scale_anchors.begin(), scale_anchors.end());
+        scale_anchors.clear();
+    }
+    ratio_anchors.clear();
+    return anchors;
+}
+
 
 #ifdef CPU_ONLY
 STUB_GPU(FrcnnProposalLayer);

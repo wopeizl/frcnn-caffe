@@ -33,34 +33,14 @@ class FrcnnProposalLayer : public Layer<Dtype> {
   virtual void LayerSetUp(const vector<Blob<Dtype>*>& bottom,
       const vector<Blob<Dtype>*>& top);
   virtual void Reshape(const vector<Blob<Dtype>*>& bottom,
-      const vector<Blob<Dtype>*>& top){};
+      const vector<Blob<Dtype>*>& top);
 
   virtual inline const char* type() const { return "FrcnnProposal"; }
 
   virtual inline int MinBottomBlobs() const { return 3; }
   virtual inline int MaxBottomBlobs() const { return 3; }
   virtual inline int MinTopBlobs() const { return 1; }
-  virtual inline int MaxTopBlobs() const { return 2; }
-
-#ifndef CPU_ONLY
-  virtual ~FrcnnProposalLayer() {
-    if (this->anchors_) {
-      CUDA_CHECK(cudaFree(this->anchors_));
-    }   
-    if (this->transform_bbox_) {
-      CUDA_CHECK(cudaFree(this->transform_bbox_));
-    }   
-    if (this->mask_) {
-      CUDA_CHECK(cudaFree(this->mask_));
-    }   
-    if (this->selected_flags_) {
-      CUDA_CHECK(cudaFree(this->selected_flags_));
-    }   
-    if (this->gpu_keep_indices_) {
-      CUDA_CHECK(cudaFree(this->gpu_keep_indices_));
-    }   
-  }
-#endif
+  virtual inline int MaxTopBlobs() const { return 1; }
 
  protected:
   virtual void Forward_cpu(const vector<Blob<Dtype>*>& bottom,
@@ -71,13 +51,32 @@ class FrcnnProposalLayer : public Layer<Dtype> {
       const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
   virtual void Backward_gpu(const vector<Blob<Dtype>*>& top,
       const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
+
+  int feat_stride_;
+  int num_anchors_;
+  Blob<float> anchors_;
+  vector<vector<float> > generate_anchors(int base_size, vector<float> ratios, vector<int> scales);
+  vector<vector<float> > _ratio_enum(vector<int> base_anchor, vector<float> ratios);
+  vector<vector<float> > _scale_enum(vector<float> base_anchor, vector<int> scales);
+
+  struct data {
+      vector<float> bbox;
+      float score;
+      int index;
+  };
+
+  struct by_score {
+      bool operator() (data const &left, data const &right) {
+          return left.score > right.score;
+      }
+  };
+
+  vector<int> nms_cpu(vector<data> dets, float thresh);
+
 #ifndef CPU_ONLY
-  // CUDA CU 
-  float* anchors_;
-  float* transform_bbox_;
-  unsigned long long *mask_;
-  int *selected_flags_;
-  int *gpu_keep_indices_;
+  Blob<int> shift_anchros_;
+  Blob<float> scores_kept_;
+  Blob<float> proposals_;
 #endif
 };
 

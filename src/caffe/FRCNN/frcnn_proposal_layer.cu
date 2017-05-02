@@ -6,264 +6,337 @@
 // ------------------------------------------------------------------
 #include <cub/cub.cuh>
 #include <iomanip>
+#include <cfloat>
+#include <cmath>
 
 #include "caffe/FRCNN/frcnn_proposal_layer.hpp"
 #include "caffe/FRCNN/util/frcnn_utils.hpp"
 #include "caffe/FRCNN/util/frcnn_helper.hpp"
 #include "caffe/FRCNN/util/frcnn_param.hpp"  
 #include "caffe/FRCNN/util/frcnn_gpu_nms.hpp"  
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/functional.h>
 
+#include <sys/time.h>
+static double getTimeOfMSeconds() {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec*1000. + tv.tv_usec/1000.;
+}
+
+static inline
+__host__ __device__ int DIVUP(const int m, const int n) {
+	return (m+n-1) / (n);
+}
 namespace caffe {
 
 namespace Frcnn {
 
 using std::vector;
 
-__global__ void GetIndex(const int n,int *indices){
-  CUDA_KERNEL_LOOP(index , n){
-    indices[index] = index;
-  }
+__global__ void EnumerateShiftedAnchors(
+	const int height, const int width, const int num_anchors,
+	const float4* anchors, int4* shifted_anchors, const int feat_stride) {
+	int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+	int tidy = blockIdx.y * blockDim.y + threadIdx.y;
+	if (tidx < width && tidy < height) {
+		const int ret_x = tidx*feat_stride;
+		const int ret_y = tidy*feat_stride;
+		for (int k = 0; k < num_anchors; k++) {
+			int4 ret;
+			ret.x = anchors[k].x + ret_x;
+			ret.y = anchors[k].y + ret_y;
+			ret.z = anchors[k].z + ret_x;
+			ret.w = anchors[k].w + ret_y;
+			int index = (tidy*width+tidx)*num_anchors + k;
+			shifted_anchors[index] = ret;
+		}
+	}
+}
+__global__ void EnumerateProposal(
+	const int height, const int width, const int num_anchors, 
+	const int im_min_size, const int im_height, const int im_width,
+	const int4* shifted_anchors, const float* bbox,
+	const float* scores, float4* proposal, float* scores_kept) {
+	int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+	int tidy = blockIdx.y * blockDim.y + threadIdx.y;
+	if (tidx < width && tidy < height) {
+		for (int k = 0; k < num_anchors; ++k) {
+			float4 ret_deltas;
+			int index = 4*k*height*width + tidy*width + tidx;
+			ret_deltas.x = bbox[index];
+			ret_deltas.y = bbox[index+height*width];
+			ret_deltas.z = bbox[index+2*height*width];
+			ret_deltas.w = bbox[index+3*height*width];
+			index = tidy*width + tidx + (num_anchors+k)*(height*width);
+			float score = scores[index];
+			index = (tidy*width+tidx)*num_anchors + k;
+			const int4 ret_shifts_anchors = shifted_anchors[index];
+			
+			float ctr_x, ctr_y, w, h;
+			float pred_ctr_x, pred_ctr_y, pred_w, pred_h;
+			w = ret_shifts_anchors.z - ret_shifts_anchors.x + 1.0;
+			h = ret_shifts_anchors.w - ret_shifts_anchors.y + 1.0;
+			ctr_x = ret_shifts_anchors.x + 0.5*w;
+			ctr_y = ret_shifts_anchors.y + 0.5*h;
+
+			pred_ctr_x = ret_deltas.x * w + ctr_x;
+			pred_ctr_y = ret_deltas.y * h + ctr_y;
+			pred_w = exp(ret_deltas.z) * w;
+			pred_h = exp(ret_deltas.w) * h;
+
+			float4 ret;
+			ret.x = max(min(pred_ctr_x - 0.5*pred_w, im_width-1.0), 0.0);
+			ret.y = max(min(pred_ctr_y - 0.5*pred_h, im_height-1.0), 0.0);
+			ret.z = max(min(pred_ctr_x + 0.5*pred_w, im_width-1.0), 0.0);
+			ret.w = max(min(pred_ctr_y + 0.5*pred_h, im_height-1.0), 0.0);
+			if ( (ret.z-ret.x+1 >= im_min_size) && (ret.w-ret.y+1 >= im_min_size) ) {
+				proposal[index] = ret;
+				scores_kept[index] = score;
+			} else {
+				scores_kept[index] = 0.0f;  //  
+			}
+		}
+	}
+}
+
+int const threadsPerBlock = sizeof(unsigned long long) * 8;
+__device__ inline float devIoU(const float4 a, const float4 b) {
+	float left = max(a.x, b.x), right = min(a.z, b.z);
+	float top = max(a.y, b.y), bottom = min(a.w, b.w);
+	float width = max(right-left + 1, 0.f), height = max(bottom - top + 1, 0.f);
+	float interS = width*height;
+	float Sa = (a.z - a.x + 1) * (a.w - a.y + 1);
+	float Sb = (b.z - b.x + 1) * (b.w - b.y + 1);
+	return interS / (Sa + Sb - interS);
+}
+__global__ void NMSKernel(const int n_boxes, const float nmx_overlap_thresh,
+	const float4* dev_boxes, unsigned long long *dev_mask) {
+	const int row_start = blockIdx.y;
+	const int col_start = blockIdx.x;
+	const int row_size = min(n_boxes - row_start*threadsPerBlock, threadsPerBlock);
+	const int col_size = min(n_boxes - col_start*threadsPerBlock, threadsPerBlock);
+	__shared__ float4 block_boxes[threadsPerBlock];
+	if (threadIdx.x < col_size) {
+		block_boxes[threadIdx.x].x = dev_boxes[threadsPerBlock*col_start + threadIdx.x].x;
+		block_boxes[threadIdx.x].y = dev_boxes[threadsPerBlock*col_start + threadIdx.x].y;
+		block_boxes[threadIdx.x].z = dev_boxes[threadsPerBlock*col_start + threadIdx.x].z;
+		block_boxes[threadIdx.x].w = dev_boxes[threadsPerBlock*col_start + threadIdx.x].w;
+	}
+	__syncthreads();
+	if (threadIdx.x < row_size) {
+		const int cur_box_idx = threadsPerBlock * row_start + threadIdx.x;
+		const float4 *cur_box = dev_boxes + cur_box_idx;
+		int i = 0;
+		unsigned long long t = 0;
+		int start = 0;
+		if ( row_start == col_start) {
+			start = threadIdx.x + 1;
+		}
+		for (i = start; i < col_size; ++i) {
+			if (devIoU(cur_box[0], block_boxes[i]) > nmx_overlap_thresh) {
+				t |= 1ULL << i;
+			}
+		}
+		const int col_blocks = DIVUP(n_boxes, threadsPerBlock);
+		dev_mask[cur_box_idx*col_blocks + col_start] = t;
+	}
+}
+void NMS_gpu(int* keep_out, int*num_out, 
+	const float4* boxes_dev, int boxes_num, float nmx_overlap_thresh) {
+	unsigned long long* mask_dev = NULL;
+	const int col_blocks = DIVUP(boxes_num, threadsPerBlock);
+	const size_t nSize = sizeof(unsigned long long)*boxes_num*col_blocks;
+	CUDA_CHECK( cudaMalloc((void**)&mask_dev, nSize) );
+	dim3 blocks(DIVUP(boxes_num, threadsPerBlock), DIVUP(boxes_num, threadsPerBlock));
+	dim3 threads(threadsPerBlock);
+	NMSKernel<<<blocks, threads>>>(boxes_num,
+			nmx_overlap_thresh, 
+			boxes_dev, 
+			mask_dev);
+
+	std::vector<unsigned long long> mask_host(boxes_num * col_blocks);
+	CUDA_CHECK( cudaMemcpy(&mask_host[0], mask_dev, nSize, cudaMemcpyDeviceToHost) );
+	std::vector<unsigned long long> remv(col_blocks);
+	memset(&remv[0], 0, sizeof(unsigned long long) * col_blocks);
+	int num_top_keep = 0;
+	for (int i = 0; i < boxes_num; ++i) {
+		int nblock = i / threadsPerBlock;
+		int inblock = i % threadsPerBlock;
+		if (!(remv[nblock] & ( 1ULL << inblock))) {
+			keep_out[num_top_keep++] = i;
+			unsigned long long *p = &mask_host[0] + i * col_blocks;
+			for (int j = nblock; j < col_blocks; ++j) {
+				remv[j] |= p[j];
+			}
+		}
+	}
+	*num_out = num_top_keep;
+	CUDA_CHECK( cudaFree(mask_dev) );
+	mask_host.clear();
+	remv.clear();
+}
+template <typename Dtype>
+__global__ void ProposalForward(const int num_out, 
+	const int* keep_out, const float4* bbox, Dtype* rois) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index < num_out) {
+		float4 ret = bbox[keep_out[index]];
+		rois[5*index + 1] = ret.x;
+		rois[5*index + 2] = ret.y;
+		rois[5*index + 3] = ret.z;
+		rois[5*index + 4] = ret.w;
+		rois[5*index + 0] = 0;
+	}
 }
 
 template <typename Dtype>
-__global__ void BBoxTransformInv(const int nthreads, const Dtype* const bottom_rpn_bbox,
-                                 const int height, const int width, const int feat_stride,
-                                 const int im_height, const int im_width,
-                                 const int* sorted_indices, const float* anchors,
-                                 float* const transform_bbox) {
-  CUDA_KERNEL_LOOP(index , nthreads) {
-    const int score_idx = sorted_indices[index];
-    const int i = score_idx % width;  // width
-    const int j = (score_idx % (width * height)) / width;  // height
-    const int k = score_idx / (width * height); // channel
-    float *box = transform_bbox + index * 4;
-    box[0] = anchors[k * 4 + 0] + i * feat_stride;
-    box[1] = anchors[k * 4 + 1] + j * feat_stride;
-    box[2] = anchors[k * 4 + 2] + i * feat_stride;
-    box[3] = anchors[k * 4 + 3] + j * feat_stride;
-    const Dtype det[4] = { bottom_rpn_bbox[(k * 4 + 0) * height * width + j * width + i],
-                           bottom_rpn_bbox[(k * 4 + 1) * height * width + j * width + i],
-                           bottom_rpn_bbox[(k * 4 + 2) * height * width + j * width + i],
-                           bottom_rpn_bbox[(k * 4 + 3) * height * width + j * width + i] };
-    float src_w = box[2] - box[0] + 1;
-    float src_h = box[3] - box[1] + 1;
-    float src_ctr_x = box[0] + 0.5 * src_w;
-    float src_ctr_y = box[1] + 0.5 * src_h;
-    float pred_ctr_x = det[0] * src_w + src_ctr_x;
-    float pred_ctr_y = det[1] * src_h + src_ctr_y;
-    float pred_w = exp(det[2]) * src_w;
-    float pred_h = exp(det[3]) * src_h;
-    box[0] = pred_ctr_x - 0.5 * pred_w;
-    box[1] = pred_ctr_y - 0.5 * pred_h;
-    box[2] = pred_ctr_x + 0.5 * pred_w;
-    box[3] = pred_ctr_y + 0.5 * pred_h;
-    box[0] = max(0.0f, min(box[0], im_width - 1.0));
-    box[1] = max(0.0f, min(box[1], im_height - 1.0));
-    box[2] = max(0.0f, min(box[2], im_width - 1.0));
-    box[3] = max(0.0f, min(box[3], im_height - 1.0));
-  }
-}
+void FrcnnProposalLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
 
-__global__ void SelectBox(const int nthreads, const float *box, float min_size,
-                          int *flags) {
-  CUDA_KERNEL_LOOP(index , nthreads) {
-    if ((box[index * 4 + 2] - box[index * 4 + 0] < min_size) ||
-        (box[index * 4 + 3] - box[index * 4 + 1] < min_size)) {
-      flags[index] = 0;
-    } else {
-      flags[index] = 1;
+	//Forward_cpu(bottom, top);
+	//return;
+	//double st = getTimeOfMSeconds();
+    int pre_nms_topN;
+    int post_nms_topN;
+    float min_size;
+    float nms_thresh;
+
+    if (this->phase_ == TRAIN) {
+        pre_nms_topN = FrcnnParam::rpn_pre_nms_top_n;
+        post_nms_topN = FrcnnParam::rpn_post_nms_top_n;
+        nms_thresh = FrcnnParam::rpn_nms_thresh;
+        min_size = FrcnnParam::rpn_min_size;
     }
-  }
-}
-
-template <typename Dtype>
-__global__ void SelectBoxByIndices(const int nthreads, const float *in_box, int *selected_indices,
-                          float *out_box, const Dtype *in_score, Dtype *out_score) {
-  CUDA_KERNEL_LOOP(index , nthreads) {
-    if ((index == 0 && selected_indices[index] == 1) ||
-        (index > 0 && selected_indices[index] == selected_indices[index - 1] + 1)) {
-      out_box[(selected_indices[index] - 1) * 4 + 0] = in_box[index * 4 + 0];
-      out_box[(selected_indices[index] - 1) * 4 + 1] = in_box[index * 4 + 1];
-      out_box[(selected_indices[index] - 1) * 4 + 2] = in_box[index * 4 + 2];
-      out_box[(selected_indices[index] - 1) * 4 + 3] = in_box[index * 4 + 3];
-      if (in_score!=NULL && out_score!=NULL) {
-        out_score[selected_indices[index] - 1] = in_score[index];
-      }
+    else {
+        pre_nms_topN = FrcnnParam::test_rpn_pre_nms_top_n;
+        post_nms_topN = FrcnnParam::test_rpn_post_nms_top_n;
+        nms_thresh = FrcnnParam::test_rpn_nms_thresh;
+        min_size = FrcnnParam::test_rpn_min_size;
     }
-  }
+
+	const Dtype* bottom_scores = bottom[0]->gpu_data();
+	const Dtype* bottom_bbox_deltas = bottom[1]->gpu_data();
+	const Dtype* bottom_im_info = bottom[2]->cpu_data();
+
+	Dtype* top_rois = top[0]->mutable_gpu_data();
+
+	int height = bottom[0]->height();
+	int width = bottom[0]->width();
+
+	dim3 block(32, 16);
+	dim3 grid(DIVUP(width, block.x), DIVUP(height, block.y));
+
+	vector<int> shape;
+	shape.push_back(num_anchors_);
+	shape.push_back(4);
+	shape.push_back(height);
+	shape.push_back(width);
+	shift_anchros_.Reshape(shape);
+	int4* shifted_anchors_data = (int4*)shift_anchros_.mutable_gpu_data();
+	const float4* anchors_data = (const float4*)anchors_.gpu_data();
+	//double et = getTimeOfMSeconds();
+	//LOG(INFO) << "P1 use time " << et-st << " ms";
+	//st = getTimeOfMSeconds();
+	EnumerateShiftedAnchors<<<grid, block>>>(height,
+			width,
+			num_anchors_,
+			anchors_data,
+			shifted_anchors_data,
+			feat_stride_);
+	cudaDeviceSynchronize();
+	//et = getTimeOfMSeconds();
+	//LOG(INFO) << "P2 use time " << et-st << " ms";
+
+	//st = getTimeOfMSeconds();
+	shape.clear();
+	shape.push_back(1);
+	shape.push_back(num_anchors_);
+	shape.push_back(height);
+	shape.push_back(width);
+	scores_kept_.Reshape(shape);
+	float* scores_kept_data = scores_kept_.mutable_gpu_data();
+
+	int im_height = bottom_im_info[0];
+	int im_width = bottom_im_info[1];
+	float im_min_size = min_size * bottom_im_info[2];
+	shape.clear();
+	shape.push_back(1);
+	shape.push_back(4*num_anchors_);
+	shape.push_back(height);
+	shape.push_back(width);
+	proposals_.Reshape(shape);
+	float4* proposals_data = (float4*)proposals_.mutable_gpu_data();
+	//et = getTimeOfMSeconds();
+	//LOG(INFO) << "P3 use time " << et-st << " ms";
+	//st = getTimeOfMSeconds();
+	EnumerateProposal<<<grid, block>>>(
+			height,
+			width,
+			num_anchors_, 
+			im_min_size, 
+			im_height, 
+			im_width,
+			shifted_anchors_data,
+			(const float*)bottom_bbox_deltas,
+			(const float*)bottom_scores,
+			proposals_data,
+			scores_kept_data);
+	cudaDeviceSynchronize();
+	//et = getTimeOfMSeconds();
+	//LOG(INFO) << "P4 use time " << et-st << " ms";
+
+	//st = getTimeOfMSeconds();
+	const int nSize = height*width*num_anchors_;
+	thrust::device_vector<float> ret_scores_kept(
+			scores_kept_data, scores_kept_data+nSize);
+	thrust::device_vector<float4> ret_bbox(
+			proposals_data, proposals_data+nSize);
+	thrust::sort_by_key(ret_scores_kept.begin(), 
+			ret_scores_kept.end(), ret_bbox.begin(), thrust::greater<float>());
+	cudaDeviceSynchronize();
+	//et = getTimeOfMSeconds();
+	//LOG(INFO) << "P5 use time " << et-st << " ms";
+
+	//st = getTimeOfMSeconds();
+	proposals_data = thrust::raw_pointer_cast(&ret_bbox[0]);
+	int* keep_out = new int[pre_nms_topN];
+	int num_out = 0;
+	if (pre_nms_topN > 0) {
+		NMS_gpu(keep_out, &num_out, proposals_data, pre_nms_topN, nms_thresh);
+	} else {
+		NMS_gpu(keep_out, &num_out, proposals_data, nSize, nms_thresh);
+	}
+	if (post_nms_topN > 0 && num_out > post_nms_topN) {
+		num_out = post_nms_topN;
+	}
+	cudaDeviceSynchronize();
+	//et = getTimeOfMSeconds();
+	//LOG(INFO) << "P6 use time " << et-st << " ms";
+
+	//st = getTimeOfMSeconds();
+	int* dev_keep_out = NULL;
+	CUDA_CHECK( cudaMalloc((void**)&dev_keep_out, sizeof(int)*num_out) );
+	CUDA_CHECK( cudaMemcpy(dev_keep_out, keep_out, 
+		sizeof(int)*num_out, cudaMemcpyHostToDevice) );
+	ProposalForward<<<DIVUP(num_out, 512), 512>>>(
+			num_out, dev_keep_out, proposals_data, top_rois);
+
+	//et = getTimeOfMSeconds();
+	//LOG(INFO) << "P7 use time " << et-st << " ms";
+	delete[] keep_out;
+	CUDA_CHECK( cudaFree(dev_keep_out) );
+	CUDA_POST_KERNEL_CHECK;
 }
 
-template <typename Dtype>
-__global__ void SelectBoxAftNMS(const int nthreads, const float *in_box, int *keep_indices,
-                          Dtype *top_data, const Dtype *in_score, Dtype* top_score) {
-  CUDA_KERNEL_LOOP(index , nthreads) {
-    top_data[index * 5] = 0;
-    int keep_idx = keep_indices[index];
-    for (int j = 1; j < 5; ++j) {
-      top_data[index * 5 + j] = in_box[keep_idx * 4 + j - 1];
-    }
-    if (top_score != NULL && in_score != NULL) {
-      top_score[index] = in_score[keep_idx];
-    }
-  }
-}
 
-template <typename Dtype>
-void FrcnnProposalLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype> *> &bottom,
-    const vector<Blob<Dtype> *> &top) {
-    DLOG(ERROR) << "========== enter proposal layer";
-  const Dtype *bottom_rpn_score = bottom[0]->gpu_data();
-  const Dtype *bottom_rpn_bbox = bottom[1]->gpu_data();
-  // bottom data comes from host memory
-  Dtype bottom_im_info[3];
-  CHECK_EQ(bottom[2]->count(), 3);
-  CUDA_CHECK(cudaMemcpy(bottom_im_info, bottom[2]->gpu_data(), sizeof(Dtype) * 3, cudaMemcpyDeviceToHost));
-
-  const int num = bottom[1]->num();
-  const int channes = bottom[1]->channels();
-  const int height = bottom[1]->height();
-  const int width = bottom[1]->width();
-  CHECK(num == 1) << "only single item batches are supported";
-  CHECK(channes % 4 == 0) << "rpn bbox pred channels should be divided by 4";
-
-  const float im_height = bottom_im_info[0];
-  const float im_width = bottom_im_info[1];
-
-  int rpn_pre_nms_top_n;
-  int rpn_post_nms_top_n;
-  float rpn_nms_thresh;
-  int rpn_min_size;
-  if (this->phase_ == TRAIN) {
-    rpn_pre_nms_top_n = FrcnnParam::rpn_pre_nms_top_n;
-    rpn_post_nms_top_n = FrcnnParam::rpn_post_nms_top_n;
-    rpn_nms_thresh = FrcnnParam::rpn_nms_thresh;
-    rpn_min_size = FrcnnParam::rpn_min_size;
-  } else {
-    rpn_pre_nms_top_n = FrcnnParam::test_rpn_pre_nms_top_n;
-    rpn_post_nms_top_n = FrcnnParam::test_rpn_post_nms_top_n;
-    rpn_nms_thresh = FrcnnParam::test_rpn_nms_thresh;
-    rpn_min_size = FrcnnParam::test_rpn_min_size;
-  }
-  LOG_IF(ERROR, rpn_pre_nms_top_n <= 0 ) << "rpn_pre_nms_top_n : " << rpn_pre_nms_top_n;
-  LOG_IF(ERROR, rpn_post_nms_top_n <= 0 ) << "rpn_post_nms_top_n : " << rpn_post_nms_top_n;
-  if (rpn_pre_nms_top_n <= 0 || rpn_post_nms_top_n <= 0 ) return;
-
-  const int config_n_anchors = FrcnnParam::anchors.size() / 4;
-  const int total_anchor_num = config_n_anchors * height * width;
-
-  //Step 1. -------------------------------Sort the rpn result----------------------
-  // the first half of rpn_score is the bg score
-  // Note that the sorting operator will change the order fg_scores (bottom_rpn_score)
-  Dtype *fg_scores = (Dtype*)(&bottom_rpn_score[total_anchor_num]);
-
-  Dtype *sorted_scores = NULL;
-  CUDA_CHECK(cudaMalloc((void**)&sorted_scores, sizeof(Dtype) * total_anchor_num));
-  cub::DoubleBuffer<Dtype> d_keys(fg_scores, sorted_scores);
-
-  int *indices = NULL;
-  CUDA_CHECK(cudaMalloc((void**)&indices, sizeof(int) * total_anchor_num));
-  GetIndex<<<caffe::CAFFE_GET_BLOCKS(total_anchor_num), caffe::CAFFE_CUDA_NUM_THREADS>>>(
-      total_anchor_num, indices);
-  cudaDeviceSynchronize();
-
-  int *sorted_indices = NULL;
-  CUDA_CHECK(cudaMalloc((void**)&sorted_indices, sizeof(int) * total_anchor_num));
-  cub::DoubleBuffer<int> d_values(indices, sorted_indices);
-
-  void *sort_temp_storage_ = NULL;
-  size_t sort_temp_storage_bytes_ = 0;
-  // calculate the temp_storage_bytes
-  cub::DeviceRadixSort::SortPairsDescending(sort_temp_storage_, sort_temp_storage_bytes_,
-                                             d_keys, d_values, total_anchor_num);
-  DLOG(ERROR) << "sort_temp_storage_bytes_ : " << sort_temp_storage_bytes_;
-  CUDA_CHECK(cudaMalloc(&sort_temp_storage_, sort_temp_storage_bytes_));
-  // sorting
-  cub::DeviceRadixSort::SortPairsDescending(sort_temp_storage_, sort_temp_storage_bytes_,
-                                            d_keys, d_values, total_anchor_num);
-  cudaDeviceSynchronize();
-
-  //Step 2. ---------------------------bbox transform----------------------------
-  const int retained_anchor_num = std::min(total_anchor_num, rpn_pre_nms_top_n);
-  // float *transform_bbox = NULL;
-  // CUDA_CHECK(cudaMalloc(&transform_bbox, sizeof(float) * retained_anchor_num * 4));
-  BBoxTransformInv<Dtype><<<caffe::CAFFE_GET_BLOCKS(retained_anchor_num), caffe::CAFFE_CUDA_NUM_THREADS>>>(
-      retained_anchor_num, bottom_rpn_bbox, height, width, FrcnnParam::feat_stride,
-      im_height, im_width, sorted_indices, anchors_, transform_bbox_);
-  cudaDeviceSynchronize();
-
-  //Step 3. -------------------------filter out small box-----------------------
-
-  // select the box larger than min size
-  // int *selected_flags = NULL;
-  // CUDA_CHECK(cudaMalloc(&selected_flags, sizeof(int) * retained_anchor_num));
-  SelectBox<<<caffe::CAFFE_GET_BLOCKS(retained_anchor_num), caffe::CAFFE_CUDA_NUM_THREADS>>>(
-      retained_anchor_num, transform_bbox_, bottom_im_info[2] * rpn_min_size, selected_flags_);
-  cudaDeviceSynchronize();
-
-  // cumulative sum up the flags to get the copy index
-  int *selected_indices_ = NULL;
-  CUDA_CHECK(cudaMalloc((void**)&selected_indices_, sizeof(int) * retained_anchor_num));
-  void *cumsum_temp_storage_ = NULL;
-  size_t cumsum_temp_storage_bytes_ = 0;
-  cub::DeviceScan::InclusiveSum(cumsum_temp_storage_, cumsum_temp_storage_bytes_,
-                                 selected_flags_, selected_indices_, retained_anchor_num);
-  DLOG(ERROR) << "cumsum_temp_storage_bytes : " << cumsum_temp_storage_bytes_;
-  CUDA_CHECK(cudaMalloc(&cumsum_temp_storage_, cumsum_temp_storage_bytes_));
-  cub::DeviceScan::InclusiveSum(sort_temp_storage_, cumsum_temp_storage_bytes_,
-                                selected_flags_, selected_indices_, retained_anchor_num);
-
-  // CUDA_CHECK(cudaFree(cumsum_temp_storage));
-
-  int selected_num = -1;
-  cudaMemcpy(&selected_num, &selected_indices_[retained_anchor_num - 1], sizeof(int), cudaMemcpyDeviceToHost);
-  CHECK_GT(selected_num, 0);
-
-  Dtype *bbox_score_ = NULL;
-  if (top.size() == 2) CUDA_CHECK(cudaMalloc(&bbox_score_, sizeof(Dtype) * retained_anchor_num));
-  SelectBoxByIndices<<<caffe::CAFFE_GET_BLOCKS(selected_num), caffe::CAFFE_CUDA_NUM_THREADS>>>(
-      selected_num, transform_bbox_, selected_flags_, transform_bbox_, sorted_scores, bbox_score_);
-  cudaDeviceSynchronize();
-  
-  //Step 4. -----------------------------apply nms-------------------------------
-  DLOG(ERROR) << "========== apply nms with rpn_nms_thresh : " << rpn_nms_thresh;
-  vector<int> keep_indices(selected_num);
-  int keep_num = -1;
-  gpu_nms(&keep_indices[0], &keep_num, transform_bbox_, selected_num, 4, rpn_nms_thresh);
-  DLOG(ERROR) << "rpn num after gpu nms: " << keep_num;
-
-  keep_num = std::min(keep_num, rpn_post_nms_top_n);
-  DLOG(ERROR) << "========== copy to top";
-  cudaMemcpy(gpu_keep_indices_, &keep_indices[0], sizeof(int) * keep_num, cudaMemcpyHostToDevice);
-
-  top[0]->Reshape(keep_num, 5, 1, 1);
-  Dtype *top_data = top[0]->mutable_gpu_data();
-  Dtype *top_score = NULL;
-  if (top.size() == 2)
-    top_score = top[1]->mutable_gpu_data();
-  SelectBoxAftNMS<<<caffe::CAFFE_GET_BLOCKS(keep_num), caffe::CAFFE_CUDA_NUM_THREADS>>>(
-      keep_num, transform_bbox_, gpu_keep_indices_, top_data, bbox_score_, top_score);
-
-  DLOG(ERROR) << "========== exit proposal layer";
-  ////////////////////////////////////
-  // do not forget to free the malloc memory
-  CUDA_CHECK(cudaFree(sorted_scores));
-  CUDA_CHECK(cudaFree(indices));
-  CUDA_CHECK(cudaFree(sorted_indices));
-  CUDA_CHECK(cudaFree(sort_temp_storage_));
-  CUDA_CHECK(cudaFree(cumsum_temp_storage_));
-  CUDA_CHECK(cudaFree(selected_indices_));
-  if (bbox_score_!=NULL)  CUDA_CHECK(cudaFree(bbox_score_));
-
-}
 
 template <typename Dtype>
 void FrcnnProposalLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype> *> &top,
     const vector<bool> &propagate_down, const vector<Blob<Dtype> *> &bottom) {
-  for (int i = 0; i < propagate_down.size(); ++i) {
-    if (propagate_down[i]) {
-      NOT_IMPLEMENTED;
-    }
-  }
+	return Backward_cpu(top, propagate_down, bottom);
 }
 
 INSTANTIATE_LAYER_GPU_FUNCS(FrcnnProposalLayer);

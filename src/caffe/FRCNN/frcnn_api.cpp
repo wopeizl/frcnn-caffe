@@ -25,6 +25,8 @@ void Detector::preprocess(const vector<float> &data, const int blob_idx){
   input_blobs[blob_idx]->Reshape(1, data.size(), 1, 1);
   float *blob_data = input_blobs[blob_idx]->mutable_cpu_data();
   std::memcpy(blob_data, &data[0], sizeof(float) * data.size());
+
+  float *d_blob_data = input_blobs[blob_idx]->mutable_gpu_data();
 }
 
 void Detector::Set_Model(std::string &proto_file, std::string &model_file, std::string default_config){
