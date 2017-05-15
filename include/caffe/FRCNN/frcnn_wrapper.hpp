@@ -35,6 +35,13 @@ namespace FRCNN_API {
         static bool postprocess(const cv::Mat &img, vector<boost::shared_ptr<Blob<float> > >& input, std::vector<caffe::Frcnn::BBox<float> > &output);
         bool predict(vector<boost::shared_ptr<Blob<float> > >& input, vector<boost::shared_ptr<Blob<float> > >& output);
 
+        // batch mode
+        bool preprocess(const cv::Mat &img_in, const int blob_idx);
+        bool preprocess(std::vector<cv::Mat >& img_in, const int blob_idx);
+        bool preprocess(const int nmat, const vector<float> &data, const int blob_idx);
+        bool predict_b(const std::vector<cv::Mat >& img_in, vector<boost::shared_ptr<Blob<float> > >& output);
+        bool postprocess_b(const std::vector<cv::Mat >& img_in, int imat, vector<boost::shared_ptr<Blob<float> > >& input, std::vector<caffe::Frcnn::BBox<float> > &results);
+
     private:
         void Set_Model(std::string &proto_file, std::string &model_file, std::string default_config);
         boost::shared_ptr<Net<float> > net_;
